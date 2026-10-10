@@ -1,3 +1,9 @@
+# why this exists?
+
+I love this transformer, but it has a lot of caveats. The biggest issue is the maxShadowFiles config. If anything other than 0, the transformer becomes unreliable. When set to 0, it causes massive delay when typechecking.
+
+I don't have time to fix the issues myself, so I let slop do it for me. These fixes were generated with GLM-5.3. Basically, all latency issues are gone, which is practically all I care about. The issue is described in detail in SLOWDOWN.md.
+
 # ts-operator-overload
 
 Typed operator overloading for TypeScript using `// @operator...` annotations
