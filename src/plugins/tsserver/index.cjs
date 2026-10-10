@@ -9,6 +9,8 @@ const {
 } = require("./shadow-language-service.cjs");
 const {createHybridCoordinator} = require("./hybrid-coordinator.cjs");
 
+const UNGUARDED_SHADOW_WARN_FILES = 400;
+
 function init(modules) {
     const ts = modules.typescript;
 
@@ -60,18 +62,28 @@ function init(modules) {
             };
         }
 
-        function canUseShadowRuntime(pluginOptions) {
-            if (pluginOptions.mode !== "shadow" && pluginOptions.mode !== "hybrid") {
-                return false;
-            }
-            if (!pluginOptions.autoFallbackToSuppress || pluginOptions.maxShadowFiles <= 0) {
-                return true;
-            }
+        let warnedUnguardedShadowSize = false;
 
-            const host = info.languageServiceHost;
-            const fileNames = host && typeof host.getScriptFileNames === "function" ? host.getScriptFileNames() : [];
-            return fileNames.length <= pluginOptions.maxShadowFiles;
-        }
+function canUseShadowRuntime(pluginOptions) {
+ if (pluginOptions.mode !== "shadow" && pluginOptions.mode !== "hybrid") {
+ return false;
+ }
+ if (!pluginOptions.autoFallbackToSuppress || pluginOptions.maxShadowFiles <= 0) {
+ const host = info.languageServiceHost;
+ const fileNames = host && typeof host.getScriptFileNames === "function" ? host.getScriptFileNames() : [];
+ if (fileNames.length > UNGUARDED_SHADOW_WARN_FILES && !warnedUnguardedShadowSize) {
+ warnedUnguardedShadowSize = true;
+ if (host && typeof host.log === "function") {
+ host.log(`[ts-operator-overload] ${fileNames.length} files with no maxShadowFiles threshold; shadow mode may be slow on large projects.`);
+ }
+ }
+ return true;
+ }
+
+ const host = info.languageServiceHost;
+ const fileNames = host && typeof host.getScriptFileNames === "function" ? host.getScriptFileNames() : [];
+ return fileNames.length <= pluginOptions.maxShadowFiles;
+}
 
         function getBaseInlayHints(fileName, span, preferences) {
             return typeof languageService.getInlayHints === "function"

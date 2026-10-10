@@ -3,6 +3,7 @@ const path = require("path");
 const {spawnSync} = require("child_process");
 const ts = require("typescript");
 const createPlugin = require("../src/plugins/tsserver/index.cjs");
+const {shadowLanguageServiceCreations} = require("../src/plugins/tsserver/shadow-language-service.cjs");
 
 const repoRoot = path.resolve(__dirname, "..");
 const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
@@ -475,10 +476,78 @@ function runTsserverProjectCheck(args) {
     }
 }
 
-function runTsserverTyped(projectRootArg) {
-    const projectRoot = path.resolve(projectRootArg || path.join("test", "tsserver-typed"));
+function runShadowReuseCheck() {
+ const projectRoot = path.resolve(path.join("test", "tsserver-typed"));
+ const projectPath = path.join(projectRoot, "tsconfig.json");
+ const parsed = loadConfig(projectPath);
 
-    runTsserverProjectCheck([projectRoot, "smart-sub-return.ts", "typed-ok", "shadow", "a", "string", "a", "string"]);
+ const files = new Map(parsed.fileNames.map((file) => [path.normalize(file), "0"]));
+ const sources = new Map([...files.keys()].map((file) => [file, ts.sys.readFile(file) || ""]));
+ let projectVersion = 1;
+
+ const host = {
+ getCompilationSettings: () => parsed.options,
+ getScriptFileNames: () => [...files.keys()],
+ getScriptVersion: (fileName) => files.get(path.normalize(fileName)) || "0",
+ getScriptSnapshot: (fileName) => ts.ScriptSnapshot.fromString(sources.get(path.normalize(fileName)) || ts.sys.readFile(fileName) || ""),
+ getCurrentDirectory: () => path.dirname(projectPath),
+ getDefaultLibFileName: (options) => ts.getDefaultLibFilePath(options),
+ getProjectVersion: () => String(projectVersion),
+ fileExists: ts.sys.fileExists,
+ readFile: ts.sys.readFile,
+ readDirectory: ts.sys.readDirectory,
+ directoryExists: ts.sys.directoryExists,
+ getDirectories: ts.sys.getDirectories
+ };
+
+ let languageService;
+ try {
+ languageService = ts.createLanguageService(host, ts.createDocumentRegistry());
+
+ const pluginFactory = createPlugin({typescript: ts});
+ const pluginLanguageService = pluginFactory.create({
+ languageService,
+ languageServiceHost: host,
+ config: {mode: "shadow", shadowScope: "project", maxShadowFiles: 0},
+ project: {}
+ });
+
+ const fileNames = [...files.keys()];
+ const overloadFile = fileNames.find((file) => file.includes("string-return")) || fileNames[0];
+ const otherFile = fileNames.find((file) => file !== overloadFile && !file.includes("number-return")) || fileNames[0];
+
+ pluginLanguageService.getSemanticDiagnostics(overloadFile);
+ const creationsAfterWarmup = shadowLanguageServiceCreations.count;
+
+ // File switches must reuse the persistent shadow program, not rebuild it.
+ pluginLanguageService.getSemanticDiagnostics(otherFile);
+ pluginLanguageService.getSemanticDiagnostics(overloadFile);
+ if (shadowLanguageServiceCreations.count !== creationsAfterWarmup) {
+ fail(`Shadow language service rebuilt on file switch (${creationsAfterWarmup} -> ${shadowLanguageServiceCreations.count} creations).`);
+ }
+
+ // An edit (version bump) must also reuse the shadow program while producing fresh diagnostics.
+ sources.set(overloadFile, sources.get(overloadFile) + "\nconst shadowReuseMissing = undefinedValue;\n");
+ files.set(overloadFile, "1");
+ projectVersion += 1;
+ const diagnosticsAfterEdit = pluginLanguageService.getSemanticDiagnostics(overloadFile);
+ if (shadowLanguageServiceCreations.count !== creationsAfterWarmup) {
+ fail(`Shadow language service rebuilt on edit (${creationsAfterWarmup} -> ${shadowLanguageServiceCreations.count} creations).`);
+ }
+ if (!diagnosticsAfterEdit.some((diagnostic) => diagnostic.code === 2304)) {
+ fail("Expected a TS2304 diagnostic after introducing an unknown identifier.");
+ }
+
+ process.stdout.write("Shadow runtime reuse check passed (no rebuild on file switch or edit).\n");
+ } finally {
+ shadowLanguageServiceCreations.count = 0;
+ }
+}
+
+function runTsserverTyped(projectRootArg) {
+ const projectRoot = path.resolve(projectRootArg || path.join("test", "tsserver-typed"));
+
+ runTsserverProjectCheck([projectRoot, "smart-sub-return.ts", "typed-ok", "shadow", "a", "string", "a", "string"]);
     runTsserverProjectCheck([projectRoot, "eq-string-return.ts", "typed-ok", "shadow", "a", "string", "a", "string"]);
     runTsserverProjectCheck([projectRoot, "string-return.ts", "typed-ok", "shadow", "a", "string", "a", "string"]);
     runTsserverProjectCheck([projectRoot, "number-return.ts", "typed-error", "shadow", "a", "number", "a", "number"]);
@@ -568,6 +637,7 @@ async function runUnified() {
     results.push(runInlineCheck("tsc-all", () => runTscAll("test")));
     results.push(runInlineCheck("tsserver-smoke", () => runTsserverSmoke(path.join("test", "tsserver-smoke"))));
     results.push(runInlineCheck("tsserver-typed", () => runTsserverTyped(path.join("test", "tsserver-typed"))));
+    results.push(runInlineCheck("tsserver-shadow-reuse", () => runShadowReuseCheck()));
 
 
     const totalMs = results.reduce((sum, item) => sum + item.durationMs, 0);

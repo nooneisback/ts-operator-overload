@@ -113,13 +113,15 @@ function createHybridCoordinator(tsModule, info) {
     }
 
     function canServeFromShadow(fileName, options) {
-        const state = getState(info);
-        const key = getRequestKey(info, fileName, options);
-        if (state.readyKey !== key) {
-            return false;
-        }
-        return !!getExistingShadowContext(tsModule, info, options, fileName);
-    }
+ const state = getState(info);
+ // The shadow program is persistent: once warmed, keep serving from it across
+ // file switches and edits. getExistingShadowContext refreshes rewrites for
+ // changed files cheaply, so an exact readyKey match is no longer required.
+ if (!state.readyKey) {
+ return false;
+ }
+ return !!getExistingShadowContext(tsModule, info, options, fileName);
+ }
 
     function dispose() {
         const state = getState(info);

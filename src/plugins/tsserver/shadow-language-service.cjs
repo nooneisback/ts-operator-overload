@@ -30,6 +30,19 @@ function getProjectVersion(baseHost, fileName) {
     return "none";
 }
 
+function getCompilerOptionsStamp(compilerOptions) {
+    // ponytail: JSON stamp covers config drift; non-serializable option values fall back to a rebuild.
+    try {
+        return JSON.stringify(compilerOptions || {});
+    } catch (_error) {
+        return String(now());
+    }
+}
+
+function now() {
+    return Date.now();
+}
+
 function normalizePathForCompare(filePath) {
     return String(filePath || "").replace(/\\/g, "/").toLowerCase();
 }
@@ -685,6 +698,7 @@ function rewriteProgramFiles(program, host, options, requestedFileName) {
 }
 
 function createShadowLanguageService(tsModule, baseHost, compilerOptions, transformedFiles, documentRegistry) {
+    shadowLanguageServiceCreations.count += 1;
     const shadowHost = {
         getCompilationSettings: () => compilerOptions,
         getScriptFileNames: () => baseHost.getScriptFileNames(),
@@ -755,6 +769,79 @@ function remapDiagnosticPosition(diagnostic, mapper) {
     };
 }
 
+function refreshShadowRewrites(session, program, options, fileName) {
+    const shadowScope = options && options.shadowScope === "project" ? "project" : "file";
+    const baseHost = session.baseHost;
+
+    if (shadowScope === "project") {
+        // In project scope the rewrite set is whole-program: reuse it verbatim while the
+        // project version is unchanged, so file switches cost nothing.
+        const projectVersion = getProjectVersion(baseHost, fileName);
+        if (projectVersion === session.projectVersion) {
+            return;
+        }
+        session.projectVersion = projectVersion;
+        syncShadowRewrites(session, program, baseHost.getScriptFileNames(), options);
+        return;
+    }
+
+    // In file scope only the requested file is rewritten; refresh just that entry so the
+    // remainder of the shadow program keeps its original sources.
+    const resolvedFileName = resolveRequestedFileName(program, baseHost, fileName);
+    if (!resolvedFileName) {
+        return;
+    }
+    const version = baseHost.getScriptVersion ? baseHost.getScriptVersion(resolvedFileName) || "0" : "0";
+    if (session.fileVersions.get(resolvedFileName) === version) {
+        return;
+    }
+    syncShadowRewrites(session, program, [resolvedFileName], options);
+}
+
+function syncShadowRewrites(session, program, fileNames, options) {
+    const {transformedFiles, mappers, fileVersions} = session;
+    const keep = new Set();
+
+    for (const fileName of fileNames) {
+        keep.add(fileName);
+        keep.add(normalizePathForCompare(fileName));
+        const sourceFile = program.getSourceFile(fileName);
+        if (!sourceFile || sourceFile.isDeclarationFile) {
+            continue;
+        }
+        const version = session.baseHost.getScriptVersion ? session.baseHost.getScriptVersion(fileName) || "0" : "0";
+        if (fileVersions.get(fileName) === version) {
+            continue;
+        }
+        const text = sourceFile.getFullText();
+        const edits = removeOverlappingEdits(collectRewriteEdits(sourceFile, program.getTypeChecker(), options));
+        if (edits.length === 0) {
+            transformedFiles.delete(fileName);
+            transformedFiles.delete(normalizePathForCompare(fileName));
+            mappers.delete(fileName);
+            mappers.delete(normalizePathForCompare(fileName));
+            fileVersions.set(fileName, version);
+            continue;
+        }
+        const transformedText = applyEditsToText(text, edits);
+        const mapper = createPositionMapper(edits, text.length, transformedText.length);
+        transformedFiles.set(fileName, transformedText);
+        transformedFiles.set(normalizePathForCompare(fileName), transformedText);
+        mappers.set(fileName, mapper);
+        mappers.set(normalizePathForCompare(fileName), mapper);
+        fileVersions.set(fileName, version);
+    }
+
+    // Drop rewrites for files that left the project so the shadow program matches its file list.
+    for (const fileName of [...transformedFiles.keys()]) {
+        if (!keep.has(fileName) && !keep.has(normalizePathForCompare(fileName))) {
+            transformedFiles.delete(fileName);
+            mappers.delete(fileName);
+            fileVersions.delete(fileName);
+        }
+    }
+}
+
 function createShadowContext(tsModule, info, options, fileName) {
     const baseLanguageService = info.languageService;
     const program = baseLanguageService.getProgram();
@@ -767,23 +854,29 @@ function createShadowContext(tsModule, info, options, fileName) {
         return null;
     }
 
+    const optionsKey = getOptionsKey(options);
+    const compilerOptionsKey = getCompilerOptionsStamp(program.getCompilerOptions());
     let cacheEntry = shadowCacheByHost.get(baseHost);
+    if (cacheEntry && (cacheEntry.optionsKey !== optionsKey || cacheEntry.compilerOptionsKey !== compilerOptionsKey)) {
+        if (cacheEntry.context && cacheEntry.context.shadowLanguageService) {
+            cacheEntry.context.shadowLanguageService.dispose();
+        }
+        cacheEntry = undefined;
+    }
     if (!cacheEntry) {
         cacheEntry = {
-            key: "",
+            optionsKey,
+            compilerOptionsKey,
             context: null,
             documentRegistry: tsModule.createDocumentRegistry()
         };
         shadowCacheByHost.set(baseHost, cacheEntry);
     }
 
-    const cacheKey = `${getOptionsKey(options)}:${fileName || ""}:${getProjectVersion(baseHost, fileName)}`;
-    if (cacheEntry.context && cacheEntry.key === cacheKey) {
+    if (cacheEntry.context) {
+        // Reuse the persistent shadow program; only re-rewrite files whose source changed.
+        refreshShadowRewrites(cacheEntry.context, program, options, fileName);
         return cacheEntry.context;
-    }
-
-    if (cacheEntry.context && cacheEntry.context.shadowLanguageService) {
-        cacheEntry.context.shadowLanguageService.dispose();
     }
 
     const rewriteResult = rewriteProgramFiles(program, baseHost, options, fileName);
@@ -798,9 +891,13 @@ function createShadowContext(tsModule, info, options, fileName) {
     cacheEntry.context = {
         baseLanguageService,
         shadowLanguageService,
-        rewriteResult
+        rewriteResult,
+        baseHost,
+        transformedFiles: rewriteResult.transformedFiles,
+        mappers: rewriteResult.mappers,
+        projectVersion: getProjectVersion(baseHost, fileName),
+        fileVersions: new Map([...rewriteResult.transformedFiles.keys()].map((name) => [name, baseHost.getScriptVersion ? baseHost.getScriptVersion(name) || "0" : "0"]))
     };
-    cacheEntry.key = cacheKey;
 
     return cacheEntry.context;
 }
@@ -812,16 +909,22 @@ function getExistingShadowContext(tsModule, info, options, fileName) {
     }
 
     const cacheEntry = shadowCacheByHost.get(baseHost);
-    if (!cacheEntry) {
+    if (!cacheEntry || !cacheEntry.context) {
         return null;
     }
 
-    const cacheKey = `${getOptionsKey(options)}:${fileName || ""}:${getProjectVersion(baseHost, fileName)}`;
-    if (cacheEntry.key !== cacheKey) {
+    if (cacheEntry.optionsKey !== getOptionsKey(options)) {
         return null;
     }
 
-    return cacheEntry.context || null;
+    // The shadow program is persistent: if the requested file changed since the last
+    // refresh, bring just its rewrite up to date instead of discarding the program.
+    refreshShadowRewrites(cacheEntry.context, baseLanguageServiceProgram(info), options, fileName);
+    return cacheEntry.context;
+}
+
+function baseLanguageServiceProgram(info) {
+    return info.languageService && info.languageService.getProgram ? info.languageService.getProgram() : null;
 }
 
 function warmShadowContext(tsModule, info, options, fileName) {
@@ -1010,8 +1113,11 @@ function getShadowInlayHints(tsModule, info, fileName, span, options, preference
     return remapInlayHints(hints, mapper);
 }
 
+const shadowLanguageServiceCreations = {count: 0};
+
 module.exports = {
     getExistingShadowContext,
+    shadowLanguageServiceCreations,
     warmShadowContext,
     getShadowSemanticDiagnostics,
     getShadowQuickInfoAtPosition,
